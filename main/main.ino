@@ -124,8 +124,8 @@ float internetWind = 0.0;
 int internetWeatherCode = 0;
 String newsHeadline = "";
 bool newsUpdated = false;
-const double DASH_LAT = 0.0;    
-const double DASH_LON = 0.0;    
+const double DASH_LAT = 13.6929;    
+const double DASH_LON = -89.2182;
 const char* RSS_URL = "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en";
 
 // -------------------------------------------------------------------------
@@ -264,55 +264,94 @@ void setup() {
       //         MODO SD
       // *******************************
       currentAudioMode = MODE_SD;
-      dibujarBarraProgreso(40, "Iniciando Audio SD...");
+      
+      // 1. Mensaje Inicial
+      mostrarPantallaCarga();
+      dibujarBarraProgreso(10, "Iniciando Audio SD...");
 
+      // 2. Iniciar Audio (Sin reproducir aún)
       out = new AudioOutputI2S();
       out->SetPinout(I2S_BCK, I2S_LRC, I2S_DOUT);
       out->SetGain(currentVolume);
       mp3 = new AudioGeneratorMP3();
+      
+      if(playlist.size() > 0) {
+          // Pre-cargar pero pausado para no gastar recursos durante la carga WiFi
+          // (Opcional: playCurrentSong(false) si tu función lo soporta, o dejarlo para el final)
+      }
 
-      if(playlist.size() > 0) playCurrentSong(false);
-
-      dibujarBarraProgreso(60, "Conectando WiFi...");
+      // 3. Conectar WiFi (Prioridad Alta)
+      dibujarBarraProgreso(30, "Conectando WiFi...");
       WiFi.begin(ssid, password);
       
       unsigned long startWifi = millis();
-      int progress = 60;
-      while(WiFi.status() != WL_CONNECTED && millis() - startWifi < 5000) { 
-         delay(200); 
-         progress += 2;
-         if(progress > 90) progress = 90;
+      int progress = 30;
+      
+      // Esperar conexión con timeout
+      while(WiFi.status() != WL_CONNECTED && millis() - startWifi < 6000) { 
+         delay(250); 
+         progress += 5;
+         if(progress > 70) progress = 70;
          dibujarBarraProgreso(progress, "Conectando WiFi...");
       }
       
+      // 4. Descargar Datos (Solo si hay WiFi)
       if(WiFi.status() == WL_CONNECTED) {
-        dibujarBarraProgreso(95, "WiFi Conectado!");
+        dibujarBarraProgreso(75, "Descargando Clima...");
         configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+        
+        // Llamada bloqueante inicial para tener datos YA
         fetch_open_meteo(DASH_LAT, DASH_LON);
+        
+        dibujarBarraProgreso(85, "Descargando Noticias...");
         fetch_first_rss_title(RSS_URL);
+        obtenerFraseDia();
       } else {
-        dibujarBarraProgreso(95, "WiFi Fallo - Modo Offline");
+        dibujarBarraProgreso(80, "WiFi Fallo - Modo Offline");
         delay(1000);
       }
+      dibujarBarraProgreso(90, "Iniciando Sensores...");
+      dht.begin(); 
+      delay(500); 
+      leerDHT11(); 
       
+      // 6. Listo
       dibujarBarraProgreso(100, "Sistema Listo!");
       delay(500);
+      
+      // Ahora sí, si hay música, cargarla (en pausa)
+      if(playlist.size() > 0) playCurrentSong(false);
   }
-
-  cal.deadzone = 200; 
-  cal.done = false; 
-  dht.begin();
-  
-  // Limpiar pantalla para iniciar la UI normal
-  tft.fillScreen(TFT_BLACK); 
-  if (numAlarmas > 0) alarmas[0] = {7, 0, false};
 }
+void leerDHTSeguro() {
+  static unsigned long lastRead = 0;
+  // Leer cada 2 minutos (120000 ms) para no molestar mucho al WiFi
+  if (millis() - lastRead > 120000 || lastRead == 0) { 
+    
+    // 1. Pausar WiFi (Modo ahorro/sin radio) para liberar el ADC2/Pin 33
+    WiFi.setSleep(true); // Opcional: WiFi.disconnect();
+    delay(100); // Dar tiempo al hardware
 
+    // 2. Leer Sensor
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+
+    if (!isnan(t)) temperatura = t;
+    if (!isnan(h)) humedad = h;
+
+    // 3. Restaurar WiFi
+    WiFi.setSleep(false); // Despertar radio
+    // Si usaste disconnect, aquí harías WiFi.reconnect();
+    
+    lastRead = millis();
+    Serial.printf("DHT Leído: %.1f C, %.1f %%\n", temperatura, humedad);
+  }
+}
 // -------------------------------------------------------------------------
-// LOOP
+// LOOP - CORREGIDO (Navegación Lógica + Botón Atrás)
 // -------------------------------------------------------------------------
 void loop() {
-  // 1. AUDIO SD (Solo procesar si estamos en modo SD y el objeto existe)
+  // 1. MANTENIMIENTO DE AUDIO (Solo si está sonando)
   if (currentAudioMode == MODE_SD && mp3) {
       if (mp3->isRunning() && !isPaused) {
           if (!mp3->loop()) {
@@ -322,18 +361,19 @@ void loop() {
           }
       }
   } else {
-      // En modo BT, damos un pequeño respiro al procesador (WDT)
-      delay(5); 
+      delay(5); // Pequeña pausa para no saturar CPU en modo BT
   }
 
-  // 2. SISTEMA
+  // 2. SISTEMA Y TAREAS DE FONDO
   if(!cal.done) {
     procesoCalibracion();
   } 
   else {
-    // Solo leer sensores y usar internet en modo SD (WiFi activo)
+    // Tareas en segundo plano (Clima, Hora, etc)
     if (currentAudioMode == MODE_SD) {
-        leerDHT11();
+        // Usar tu función de lectura segura si la implementaste, sino la normal
+        // leerDHTSeguro(); o leerDHT11();
+        leerDHT11(); 
         obtenerFraseDia();
         internet_open_meteo_loop(DASH_LAT, DASH_LON);
         news_rss_loop(RSS_URL);
@@ -341,96 +381,128 @@ void loop() {
 
     unsigned long now = millis();
     DPadDir dir = detectarDireccionJoystick();
+    
+    // Variables estáticas para control de redibujado
     static bool dashboardDrawn = false, alarmasDrawn = false, musicaDrawn = false;
     static int lastNavIndex = -1;
-    static DPadDir lastDir = DPAD_NONE;
+    static DPadDir lastDir = DPAD_NONE; // Para evitar rebotes del stick
 
-    // --- CASO ESPECIAL: PANTALLA DE MÚSICA ---
-    // Delega el control total a musicaHandleInput
+    // --- LÓGICA DE CONTROL ---
+
+    // CASO ESPECIAL: PANTALLA DE MÚSICA (Tiene su propio control interno)
     if (pantallaActual == MUSICA && !barraActiva) {
         bool inputConsumido = musicaHandleInput(dir, leerBoton(BTN_1), leerBoton(BTN_2));
-        // Si musica.h devuelve false (llegó al tope), activamos la barra
+        
+        // Si la pantalla de música no usó el "ARRIBA", subimos a la barra
         if (!inputConsumido && dir == DPAD_UP && lastDir != DPAD_UP) {
-            barraActiva = true; delay(150); 
+            barraActiva = true; 
+            delay(150); 
         }
         lastDir = dir; 
     }
-    // --- NAVEGACIÓN GENERAL (DASHBOARD / ALARMAS / BARRA ACTIVA) ---
     else {
+        // --- NAVEGACIÓN GENERAL (Dashboard y Alarmas) ---
         if (now - lastNavTime > NAV_DELAY) {
           bool huboMovimiento = false;
-          DPadDir upDir = invertYAxis ? DPAD_DOWN : DPAD_UP;
-          DPadDir downDir = invertYAxis ? DPAD_UP : DPAD_DOWN;
 
-          // 1. ACTIVAR BARRA (Subir)
-          // MODIFICACIÓN: No activar barra automáticamente en ALARMAS.
-          // Dejamos que 'alarmas.h' active la barra cuando pasemos el ítem 0.
-          if (pantallaActual != ALARMAS) { 
-               if (dir == upDir && lastDir != upDir && !barraActiva) { 
-                   barraActiva = true; huboMovimiento = true; 
-               }
-          }
-          
-          // 2. DESACTIVAR BARRA (Bajar)
-          // Si estamos en la barra y bajamos, entramos a la pantalla
-          else if (dir == downDir && lastDir != downDir && barraActiva) {
-            barraActiva = false;
-            huboMovimiento = true;
-            
-            // Resetear índice de alarmas al entrar desde arriba
-            if (pantallaActual == ALARMAS) menuAlarmaIndex = 0;
+          // 1. ENTRAR A LA BARRA (Mover palanca ARRIBA)
+          if (dir == DPAD_UP && lastDir != DPAD_UP && !barraActiva) { 
+              barraActiva = true; 
+              huboMovimiento = true; 
+          } 
+          // 2. SALIR DE LA BARRA (Mover palanca ABAJO) [ESTO ES LO QUE FALLABA]
+          else if (dir == DPAD_DOWN && lastDir != DPAD_DOWN && barraActiva) { 
+              barraActiva = false; 
+              huboMovimiento = true; 
+              
+              // Forzar redibujado para borrar rastros de la barra
+              if(pantallaActual == DASHBOARD) dashboardDrawn = false;
+              if(pantallaActual == ALARMAS) alarmasDrawn = false;
+              if(pantallaActual == MUSICA) musicaDrawn = false;
           }
 
-          // 3. MOVERSE EN LA BARRA (Izquierda/Derecha)
+          // 3. MOVERSE LATERALMENTE EN LA BARRA
           if (barraActiva) {
-            if (dir == DPAD_LEFT && lastDir != DPAD_LEFT) { navIndex = (navIndex - 1 + 3) % 3; huboMovimiento = true; }
-            if (dir == DPAD_RIGHT && lastDir != DPAD_RIGHT) { navIndex = (navIndex + 1) % 3; huboMovimiento = true; }
+            if (dir == DPAD_LEFT && lastDir != DPAD_LEFT) { 
+                navIndex = (navIndex - 1 + 3) % 3; 
+                huboMovimiento = true; 
+            }
+            if (dir == DPAD_RIGHT && lastDir != DPAD_RIGHT) { 
+                navIndex = (navIndex + 1) % 3; 
+                huboMovimiento = true; 
+            }
           } else { 
+            // Si la barra no está activa, el índice sigue a la pantalla actual
             navIndex = pantallaActual; 
           }
           
           if (huboMovimiento) lastNavTime = now;
         }
 
-        // Botones Generales (Cuando la barra está activa)
+        // --- LÓGICA DE BOTONES ---
         if (now - lastBtnTime > BTN_DELAY) {
           if (barraActiva) {
+            // BTN 1: SELECCIONAR (Entrar a la pantalla)
             if (leerBoton(BTN_1)) { 
                 pantallaActual = (Pantalla)navIndex; 
-                // Forzar redibujado al cambiar pantalla
+                // Forzamos redibujado de todo al cambiar pantalla
                 dashboardDrawn = false; alarmasDrawn = false; musicaDrawn = false; 
-                barraActiva = false; 
+                barraActiva = false; // Al entrar, desactivamos la barra automáticamente
                 lastBtnTime = now; 
             }
-            if (leerBoton(BTN_2)) { barraActiva = false; lastBtnTime = now; }
+            
+            // BTN 2: SALIR / CANCELAR (Quitar la barra) [NUEVO]
+            if (leerBoton(BTN_2)) { 
+                barraActiva = false; // Desactivar barra
+                // Forzamos redibujado para limpiar la selección naranja
+                if(pantallaActual == DASHBOARD) dashboardDrawn = false;
+                if(pantallaActual == ALARMAS) alarmasDrawn = false;
+                if(pantallaActual == MUSICA) musicaDrawn = false;
+                lastBtnTime = now; 
+            }
           }
         }
         lastDir = dir;
     }
 
-    // --- SWITCH DE PANTALLAS ---
+    // --- GESTOR DE PANTALLAS (SWITCH) ---
     switch(pantallaActual) {
       case DASHBOARD:
         {
           bool forceUpdate = !dashboardDrawn; 
-          if (forceUpdate) { dibujarBaseDashboard(navIndex); dashboardDrawn = true; alarmasDrawn = musicaDrawn = false; }
+          if (forceUpdate) { 
+              dibujarBaseDashboard(navIndex); 
+              dashboardDrawn = true; alarmasDrawn = false; musicaDrawn = false; 
+          }
+          // Dibujar barra (se encarga de iluminarse si barraActiva es true)
           dibujarBarraNavegacion(navIndex);
+          
           if(currentAudioMode == MODE_SD) {
-             actualizarRelojFecha(forceUpdate); actualizarCalendario(forceUpdate);
-             actualizarFrase(forceUpdate); actualizarDatosSensor(forceUpdate);
+             actualizarRelojFecha(forceUpdate); 
+             actualizarCalendario(forceUpdate);
+             actualizarFrase(forceUpdate); 
+             actualizarDatosSensor(forceUpdate);
           }
         }
         break;
         
       case ALARMAS:
-        if (!alarmasDrawn) { dibujarPantallaAlarmas(navIndex); alarmasDrawn = true; dashboardDrawn = musicaDrawn = false; }
+        if (!alarmasDrawn) { 
+            dibujarPantallaAlarmas(navIndex); 
+            alarmasDrawn = true; dashboardDrawn = false; musicaDrawn = false; 
+        }
         dibujarBarraNavegacion(navIndex); 
-        actualizarPantallaAlarmas(); // Esta función maneja la lista y activará barraActiva si subes mucho
+        actualizarPantallaAlarmas(); 
         break;
         
       case MUSICA:
+        // Asegurar nombre canción
         if(playlist.size() > 0 && currentAudioMode == MODE_SD) cancionActual = playlist[songIndex];
-        if (!musicaDrawn) { dibujarPantallaMusica(navIndex); musicaDrawn = true; dashboardDrawn = alarmasDrawn = false; }
+        
+        if (!musicaDrawn) { 
+            dibujarPantallaMusica(navIndex); 
+            musicaDrawn = true; dashboardDrawn = false; alarmasDrawn = false; 
+        }
         dibujarBarraNavegacion(navIndex); 
         actualizarPantallaMusica();
         break;
