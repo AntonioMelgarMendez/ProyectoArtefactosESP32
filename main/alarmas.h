@@ -1,19 +1,30 @@
 #pragma once
 #include <TFT_eSPI.h>
+#include <time.h>
+#include <math.h> // Necesario para sin()
 #include "utils.h"
 #include "joystick.h"
 
+// Necesario para emitir sonido de alarma
+#include "AudioGeneratorMP3.h"
+#include "AudioOutputI2S.h"
+
+// --- DEFINICIÓN DE PINES NECESARIA ---
+#ifndef PIN_AMP_ENABLE
+#define PIN_AMP_ENABLE 12
+#endif
+
 extern TFT_eSPI tft;
 extern bool barraActiva; 
+extern int navIndex;
+extern AudioOutputI2S *out; 
 
-// Definición del tipo Alarma
 struct Alarma {
   int hora;
   int minuto;
   bool activa;
 };
 
-// Variables externas (definidas en main.ino)
 extern Alarma alarmas[5];
 extern int numAlarmas;
 extern int alarmaSeleccionada;
@@ -22,253 +33,248 @@ extern bool modoAgregarAlarma;
 extern int nuevaHora, nuevoMinuto;
 extern int menuAlarmaIndex;
 
-// dibuja una fila de alarma (index dentro del listado)
-inline void dibujarFilaAlarma(int index, bool selected) {
-  int x = 60;
-  int y = 60 + index * 30;
-  // fondo para selección
-  if (selected) tft.fillRect(x - 6, y - 2, 360, 22, TFT_DARKGREY);
-  else tft.fillRect(x - 6, y - 2, 360, 22, TFT_BLACK);
+// Timers locales
+unsigned long lastAlarmaNavTime = 0;
+unsigned long lastAlarmaBtnTime = 0;
 
-  tft.setTextSize(2);
-  tft.setTextColor(selected ? TFT_CYAN : TFT_WHITE);
-  tft.setCursor(x, y);
-  tft.printf("%d) %02d:%02d %s", index + 1, alarmas[index].hora, alarmas[index].minuto, alarmas[index].activa ? "ON" : "OFF");
+// ---------------------------------------------------------
+// 1. FUNCIONES AUXILIARES DE SONIDO (ARMÓNICO)
+// ---------------------------------------------------------
+
+// Limpia el buffer de audio
+void silenciarAudio() {
+  if (out) {
+     int16_t silence[2] = {0, 0};
+     for (int i=0; i<512; i++) out->ConsumeSample(silence);
+  }
 }
 
-// dibuja la línea "+ Agregar"
-inline void dibujarFilaAgregar(bool selected) {
-  int x = 60;
-  int y = 60 + numAlarmas * 30;
-  if (selected) tft.fillRect(x - 6, y - 2, 360, 22, TFT_DARKGREY);
-  else tft.fillRect(x - 6, y - 2, 360, 22, TFT_BLACK);
+// Genera una nota suave usando onda senoidal
+// Retorna true si se presionó un botón para cancelar
+bool tocarNotaSuave(int freq, int durationMs) {
+  if (!out) return false;
+  
+  int sampleRate = 44100;
+  int numSamples = (sampleRate * durationMs) / 1000;
+  int16_t sample[2];
+  int16_t volumen = 10000; // Volumen agradable
 
-  tft.setTextSize(2);
-  tft.setTextColor(selected ? TFT_ORANGE : TFT_WHITE);
-  tft.setCursor(x, y);
-  tft.print("+ Agregar nueva alarma");
+  for (int i = 0; i < numSamples; i++) {
+    double t = (double)i / sampleRate;
+    int16_t val = (int16_t)(volumen * sin(2.0 * PI * freq * t));
+    
+    // Fade Out al final para evitar "clic"
+    if (i > numSamples - 1000) {
+       val = val * (numSamples - i) / 1000;
+    }
+
+    sample[0] = val;
+    sample[1] = val;
+    out->ConsumeSample(sample);
+
+    // Revisar botones frecuentemente
+    if (i % 500 == 0) {
+       if (leerBoton(BTN_1) || leerBoton(BTN_2)) return true; 
+    }
+  }
+  return false;
 }
 
-inline void dibujarPantallaAlarmas(int navIndex) {
+// ---------------------------------------------------------
+// 2. DIBUJO DE INTERFAZ (TU CÓDIGO ORIGINAL)
+// ---------------------------------------------------------
+
+void dibujarFilaAlarma(int index, bool selected) {
+  int x = 60; int y = 60 + index * 40; 
+  tft.startWrite();
+  uint16_t bg = selected ? TFT_ORANGE : TFT_BLACK;
+  uint16_t fg = selected ? TFT_BLACK : TFT_WHITE;
+  tft.fillRoundRect(x - 10, y - 5, 380, 32, 6, bg);
+  tft.setTextSize(2); tft.setTextColor(fg, bg); tft.setCursor(x, y);
+  tft.printf("%02d:%02d", alarmas[index].hora, alarmas[index].minuto);
+  tft.setCursor(x + 250, y);
+  if(alarmas[index].activa) { tft.setTextColor(selected ? TFT_BLACK : TFT_GREEN, bg); tft.print("ON"); } 
+  else { tft.setTextColor(selected ? TFT_BLACK : TFT_RED, bg); tft.print("OFF"); }
+  tft.endWrite();
+}
+
+void dibujarBotonAgregar(bool selected) {
+  int x = 60; int y = 60 + numAlarmas * 40;
+  tft.startWrite();
+  uint16_t bg = selected ? TFT_CYAN : TFT_DARKGREY;
+  uint16_t fg = selected ? TFT_BLACK : TFT_WHITE;
+  tft.fillRoundRect(x - 10, y - 5, 380, 32, 6, bg);
+  tft.setTextSize(2); tft.setTextColor(fg, bg);
+  String texto = "+ NUEVA ALARMA";
+  int textW = tft.textWidth(texto);
+  tft.setCursor(x - 10 + (380 - textW)/2, y + 8); 
+  tft.print(texto);
+  tft.endWrite();
+}
+
+void dibujarPantallaAlarmas(int navIndex); 
+
+void dibujarModalAgregarAlarma(bool editandoHora, bool forceRedraw = false) {
+  const int w = 260; const int h = 160; const int x = (480 - w) / 2; const int y = (320 - h) / 2;
+  tft.startWrite();
+  if (forceRedraw) {
+    tft.fillRoundRect(x+5, y+5, w, h, 10, TFT_DARKGREY); 
+    tft.fillRoundRect(x, y, w, h, 10, TFT_BLUE);         
+    tft.drawRoundRect(x, y, w, h, 10, TFT_WHITE);        
+    tft.setTextColor(TFT_WHITE, TFT_BLUE); tft.setTextSize(2);
+    tft.drawCentreString("CONFIGURAR HORA", 240, y + 15, 2);
+    tft.setTextSize(1); tft.setCursor(x + 20, y + 125); tft.print("[BTN1] Guardar");
+    tft.setCursor(x + 140, y + 125); tft.print("[BTN2] Cancelar");
+  }
+  int boxW = 60; int boxH = 50; int gap = 10; int startX = x + (w - (boxW*2 + gap))/2; int startY = y + 50;
+  uint16_t colorH = editandoHora ? TFT_YELLOW : TFT_NAVY; uint16_t textH = editandoHora ? TFT_BLACK : TFT_WHITE;
+  tft.fillRoundRect(startX, startY, boxW, boxH, 8, colorH); tft.setTextColor(textH, colorH); tft.setTextSize(3); 
+  int offH = (nuevaHora < 10) ? 20 : 10; tft.setCursor(startX + offH, startY + 15); tft.print(nuevaHora);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE); tft.setCursor(startX + boxW - 2, startY + 15); tft.print(":");
+  int minX = startX + boxW + gap; uint16_t colorM = !editandoHora ? TFT_YELLOW : TFT_NAVY; uint16_t textM = !editandoHora ? TFT_BLACK : TFT_WHITE;
+  tft.fillRoundRect(minX, startY, boxW, boxH, 8, colorM); tft.setTextColor(textM, colorM);
+  int offM = (nuevoMinuto < 10) ? 20 : 10; tft.setCursor(minX + offM, startY + 15);
+  if(nuevoMinuto < 10) tft.print("0"); tft.setCursor(minX + offM + (nuevoMinuto<10?18:15), startY + 15); tft.print(nuevoMinuto);
+  tft.endWrite();
+}
+
+// ---------------------------------------------------------
+// 3. POPUP DE ALARMA (CON NUEVO SONIDO)
+// ---------------------------------------------------------
+
+void sonarAlarmaBloqueante() {
+  // Activar amplificador
+  digitalWrite(PIN_AMP_ENABLE, HIGH);
+  if(out) out->SetGain(1.0); 
+
+  // Dibujar Popup
+  tft.startWrite();
+  tft.fillScreen(TFT_RED);
+  tft.fillRoundRect(40, 80, 400, 160, 20, TFT_WHITE);
+  tft.drawRoundRect(40, 80, 400, 160, 20, TFT_BLACK);
+  tft.setTextColor(TFT_RED, TFT_WHITE); tft.setTextSize(3);
+  tft.drawCentreString("! ALARMA !", 240, 110, 4);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE); tft.setTextSize(2);
+  tft.drawCentreString("Presiona cualquier", 240, 160, 2);
+  tft.drawCentreString("boton para detener", 240, 190, 2);
+  tft.endWrite();
+
+  bool cancelado = false;
+
+  while(!cancelado) {
+      // Reproducir Melodía Suave (Do-Mi-Sol)
+      // Si tocan un botón durante la nota, retorna true y salimos
+      if (tocarNotaSuave(523, 300)) { cancelado = true; break; } // Do
+      delay(50);
+      if (tocarNotaSuave(659, 300)) { cancelado = true; break; } // Mi
+      delay(50);
+      if (tocarNotaSuave(784, 600)) { cancelado = true; break; } // Sol
+
+      // Espera silenciosa entre repeticiones (1 segundo)
+      unsigned long wait = millis();
+      while(millis() - wait < 1000) {
+          if (leerBoton(BTN_1) || leerBoton(BTN_2)) {
+              cancelado = true;
+              break;
+          }
+          delay(10);
+      }
+  }
+  
+  // Salida limpia
+  silenciarAudio();
+  digitalWrite(PIN_AMP_ENABLE, LOW); 
+  if(out) out->SetGain(0.3); 
+  
+  mostrarModalAlarma = false;
+  if(alarmaSeleccionada >= 0) alarmas[alarmaSeleccionada].activa = false;
+  dibujarPantallaAlarmas(navIndex); 
+}
+
+// ---------------------------------------------------------
+// 4. LÓGICA PRINCIPAL
+// ---------------------------------------------------------
+
+void dibujarPantallaAlarmas(int navIndex) {
   tft.fillScreen(TFT_BLACK);
-  dibujarBarraNavegacion(navIndex);
-
-  // dibujar todo el listado (se llamará una sola vez al entrar)
-  for (int i = 0; i < numAlarmas; i++) dibujarFilaAlarma(i, i == menuAlarmaIndex);
-  dibujarFilaAgregar(menuAlarmaIndex == numAlarmas);
-
-  tft.setTextColor(TFT_WHITE); tft.setTextSize(2);
-  tft.setCursor(30, 250); tft.print("Arriba/Abajo: Navegar  BTN1: Seleccionar  BTN2: Cancelar");
+  dibujarBarraNavegacion(navIndex, true); 
+  for (int i = 0; i < numAlarmas; i++) dibujarFilaAlarma(i, i == 0);
+  dibujarBotonAgregar(numAlarmas == 0);
 }
 
-// Modal centrado: dibuja contenido según valores actuales
-inline void dibujarModalAgregarAlarma(bool editHora) {
-  const int modalW = 320, modalH = 160;
-  int mx = (tft.width() - modalW) / 2;
-  int my = (tft.height() - modalH) / 2;
-
-  // fondo y borde
-  tft.fillRoundRect(mx, my, modalW, modalH, 12, TFT_YELLOW);
-  tft.drawRoundRect(mx, my, modalW, modalH, 12, TFT_RED);
-
-  tft.setTextSize(2); tft.setTextColor(TFT_RED);
-  tft.setCursor(mx + 24, my + 12); tft.print("Nueva alarma");
-
-  // hora:min con indicador de selección
-  tft.setTextSize(3);
-  // limpiar área del tiempo
-  tft.fillRect(mx + 24, my + 44, modalW - 48, 60, TFT_YELLOW);
-
-  // pintar hora y minuto
-  int hx = mx + 40;
-  int hy = my + 56;
-  // hora
-  if (editHora) {
-    tft.fillRoundRect(hx - 6, hy - 6, 88, 40, 6, TFT_ORANGE);
-    tft.setTextColor(TFT_BLACK);
-  } else {
-    tft.setTextColor(TFT_BLACK);
-  }
-  tft.setCursor(hx, hy);
-  tft.printf("%02d", nuevaHora);
-
-  // separador
-  tft.setTextColor(TFT_BLACK); tft.setCursor(hx + 48, hy); tft.print(":");
-
-  // minuto
-  int mxpos = hx + 64;
-  if (!editHora) {
-    tft.fillRoundRect(mxpos - 6, hy - 6, 88, 40, 6, TFT_ORANGE);
-    tft.setTextColor(TFT_BLACK);
-  } else {
-    tft.setTextColor(TFT_BLACK);
-  }
-  tft.setCursor(mxpos, hy);
-  tft.printf("%02d", nuevoMinuto);
-
-  // instrucciones
-  tft.setTextSize(1);
-  tft.setTextColor(TFT_BLACK);
-  tft.setCursor(mx + 24, my + modalH - 36);
-  tft.print("Izq/Der: Seleccionar  Arriba/Abajo: Cambiar");
-  tft.setCursor(mx + 24, my + modalH - 20);
-  tft.print("BTN1: Guardar   BTN2: Cancelar");
-}
-
-// Actualización eficiente: sólo redibuja filas cambiadas y modal cuando corresponde
 inline void actualizarPantallaAlarmas() {
-  static bool listDrawn = false;
-  static int lastMenuIndex = -1;
-  static int lastNumAlarmas = -1;
-  static bool lastActive[5] = {false,false,false,false,false};
-  static bool modalDrawn = false;
-  static bool editHora = true;
-  static DPadDir lastDir = DPAD_NONE;
+  unsigned long now = millis();
+  static bool editandoHora = true;
+  static int lastIndex = -1;
+  
+  static int lastH = -1; static int lastM = -1;
+  static bool lastEditMode = false; static bool modalAbiertoPrevio = false;
+  static int ultimoMinutoSonado = -1;
 
-  // si no estamos en modal, gestionar listado
-  if (!modoAgregarAlarma) {
-    modalDrawn = false;
-    // (re)dibuja lista completa si entramos por primera vez o cambió el número de alarmas
-    if (!listDrawn || lastNumAlarmas != numAlarmas) {
-      // redibujar contenedor
-      tft.fillRect(0, 48, tft.width(), tft.height()-48, TFT_BLACK); // limpia la zona de contenido
+  // === CHECK ALARMA ===
+  struct tm t; 
+  if(getLocalTime(&t)) {
+      if (t.tm_min != ultimoMinutoSonado) ultimoMinutoSonado = -1; 
+
       for (int i = 0; i < numAlarmas; i++) {
-        dibujarFilaAlarma(i, i == menuAlarmaIndex);
-        lastActive[i] = alarmas[i].activa;
-      }
-      dibujarFilaAgregar(menuAlarmaIndex == numAlarmas);
-      lastNumAlarmas = numAlarmas;
-      listDrawn = true;
-      lastMenuIndex = menuAlarmaIndex;
-      return;
-    }
-
-    // actualizar filas cuya activacion cambió
-    for (int i = 0; i < numAlarmas; i++) {
-      if (alarmas[i].activa != lastActive[i]) {
-        dibujarFilaAlarma(i, i == menuAlarmaIndex);
-        lastActive[i] = alarmas[i].activa;
-      }
-    }
-
-    // actualizar selección si cambió
-    if (menuAlarmaIndex != lastMenuIndex) {
-      // repintar anterior fila sin selección
-      if (lastMenuIndex >= 0 && lastMenuIndex < numAlarmas) dibujarFilaAlarma(lastMenuIndex, false);
-      else if (lastMenuIndex == numAlarmas) dibujarFilaAgregar(false);
-
-      // pintar nueva fila seleccionada
-      if (menuAlarmaIndex >= 0 && menuAlarmaIndex < numAlarmas) dibujarFilaAlarma(menuAlarmaIndex, true);
-      else if (menuAlarmaIndex == numAlarmas) dibujarFilaAgregar(true);
-
-      lastMenuIndex = menuAlarmaIndex;
-      delay(120);
-    }
-
-    // navegación
-    DPadDir dir = detectarDireccionJoystick();
-     if (barraActiva) dir = DPAD_NONE;
-    if (dir == DPAD_UP && lastDir != DPAD_UP) {
-      menuAlarmaIndex = (menuAlarmaIndex - 1 + numAlarmas + 1) % (numAlarmas + 1);
-      delay(150);
-    } else if (dir == DPAD_DOWN && lastDir != DPAD_DOWN) {
-      menuAlarmaIndex = (menuAlarmaIndex + 1) % (numAlarmas + 1);
-      delay(150);
-    }
-
-    // seleccionar / toggle / entrar modal
-    if (leerBoton(BTN_1)) {
-      if (menuAlarmaIndex < numAlarmas) {
-        alarmas[menuAlarmaIndex].activa = !alarmas[menuAlarmaIndex].activa;
-        dibujarFilaAlarma(menuAlarmaIndex, menuAlarmaIndex == lastMenuIndex);
-      } else {
-        // abrir modal
-        modoAgregarAlarma = true;
-        nuevaHora = 7;
-        nuevoMinuto = 0;
-        modalDrawn = false;
-        editHora = true;
-      }
-      delay(200);
-    }
-
-    lastDir = dir;
-  } else {
-    // MODO MODAL: dibujar modal una sola vez y actualizar campos sólo cuando cambian
-    DPadDir dir = detectarDireccionJoystick();
-    if (!modalDrawn) {
-      // limpiar área detrás del modal (suaviza)
-      tft.fillRect(40, 70, tft.width()-80, tft.height()-140, TFT_BLACK);
-      dibujarModalAgregarAlarma(editHora);
-      modalDrawn = true;
-    } else {
-      // detectar navegación horizontal para cambiar campo seleccionado
-      if (dir == DPAD_LEFT && lastDir != DPAD_LEFT) { editHora = true; dibujarModalAgregarAlarma(editHora); delay(120); }
-      else if (dir == DPAD_RIGHT && lastDir != DPAD_RIGHT) { editHora = false; dibujarModalAgregarAlarma(editHora); delay(120); }
-
-      // up/down cambia valor del campo seleccionado
-      if (dir == DPAD_UP && lastDir != DPAD_UP) {
-        if (editHora) nuevaHora = (nuevaHora + 1) % 24;
-        else nuevoMinuto = (nuevoMinuto + 1) % 60;
-        dibujarModalAgregarAlarma(editHora);
-        delay(120);
-      } else if (dir == DPAD_DOWN && lastDir != DPAD_DOWN) {
-        if (editHora) nuevaHora = (nuevaHora - 1 + 24) % 24;
-        else nuevoMinuto = (nuevoMinuto - 1 + 60) % 60;
-        dibujarModalAgregarAlarma(editHora);
-        delay(120);
-      }
-
-      // BTN1: guardar
-      if (leerBoton(BTN_1)) {
-        if (numAlarmas < 5) {
-          alarmas[numAlarmas].hora = nuevaHora;
-          alarmas[numAlarmas].minuto = nuevoMinuto;
-          alarmas[numAlarmas].activa = true;
-          numAlarmas++;
+        if (alarmas[i].activa && t.tm_hour == alarmas[i].hora && t.tm_min == alarmas[i].minuto && t.tm_sec == 0 && ultimoMinutoSonado != t.tm_min) {
+          alarmaSeleccionada = i;
+          sonarAlarmaBloqueante(); 
+          ultimoMinutoSonado = t.tm_min; 
+          return; 
         }
-        modoAgregarAlarma = false;
-        // forzar re-draw del listado en la próxima iteración
-        listDrawn = false;
-        modalDrawn = false;
-        delay(300);
       }
-
-      // BTN2: cancelar
-      if (leerBoton(BTN_2)) {
-        modoAgregarAlarma = false;
-        listDrawn = false;
-        modalDrawn = false;
-        delay(300);
-      }
-
-      lastDir = dir;
-    }
   }
 
-  // comprobación de alarmas activas para mostrar modal de alarma si corresponde
-  struct tm t; getLocalTime(&t);
-  for (int i = 0; i < numAlarmas; i++) {
-    if (alarmas[i].activa && t.tm_hour == alarmas[i].hora && t.tm_min == alarmas[i].minuto && !mostrarModalAlarma) {
-      mostrarModalAlarma = true;
-      alarmaSeleccionada = i;
-    }
+  // === MODO EDICIÓN ===
+  if (modoAgregarAlarma) {
+      bool firstOpen = !modalAbiertoPrevio;
+      if (firstOpen || lastH != nuevaHora || lastM != nuevoMinuto || lastEditMode != editandoHora) {
+          dibujarModalAgregarAlarma(editandoHora, firstOpen); 
+          lastH = nuevaHora; lastM = nuevoMinuto; lastEditMode = editandoHora;
+      }
+      modalAbiertoPrevio = true;
+
+      if (now - lastAlarmaNavTime > 150) {
+          DPadDir dir = detectarDireccionJoystick();
+          if (dir == DPAD_LEFT) editandoHora = true;
+          if (dir == DPAD_RIGHT) editandoHora = false;
+          if (dir == DPAD_UP) { if(editandoHora) nuevaHora = (nuevaHora + 1) % 24; else nuevoMinuto = (nuevoMinuto + 1) % 60; lastAlarmaNavTime = now; }
+          if (dir == DPAD_DOWN) { if(editandoHora) nuevaHora = (nuevaHora - 1 + 24) % 24; else nuevoMinuto = (nuevoMinuto - 1 + 60) % 60; lastAlarmaNavTime = now; }
+      }
+
+      if (now - lastAlarmaBtnTime > 300) {
+          if (leerBoton(BTN_1)) { 
+              if (numAlarmas < 5) { alarmas[numAlarmas].hora = nuevaHora; alarmas[numAlarmas].minuto = nuevoMinuto; alarmas[numAlarmas].activa = true; numAlarmas++; }
+              modoAgregarAlarma = false; modalAbiertoPrevio = false; dibujarPantallaAlarmas(navIndex); 
+          }
+          if (leerBoton(BTN_2)) { modoAgregarAlarma = false; modalAbiertoPrevio = false; dibujarPantallaAlarmas(navIndex); }
+          lastAlarmaBtnTime = now;
+      }
+      return; 
   }
 
-  if (mostrarModalAlarma) {
-    tft.fillRoundRect(80, 100, 320, 100, 12, TFT_YELLOW);
-    tft.setTextColor(TFT_RED); tft.setTextSize(3);
-    tft.setCursor(120, 130); tft.print("¡ALARMA!");
-    tft.setTextColor(TFT_BLACK); tft.setTextSize(2);
-    tft.setCursor(120, 170); tft.print("Presiona cualquier boton");
-    if (leerBoton(BTN_1) || leerBoton(BTN_2)) {
-      mostrarModalAlarma = false;
-      alarmas[alarmaSeleccionada].activa = false;
-      // forzar redraw de la fila apagada
-      if (alarmaSeleccionada >= 0 && alarmaSeleccionada < numAlarmas) {
-        dibujarFilaAlarma(alarmaSeleccionada, menuAlarmaIndex == alarmaSeleccionada);
+  // === MODO LISTA ===
+  if (barraActiva) return; 
+
+  if (now - lastAlarmaNavTime > 150) {
+      DPadDir dir = detectarDireccionJoystick();
+      if (dir == DPAD_DOWN) { if (menuAlarmaIndex < numAlarmas) { menuAlarmaIndex++; lastAlarmaNavTime = now; } } 
+      else if (dir == DPAD_UP) { if (menuAlarmaIndex > 0) { menuAlarmaIndex--; lastAlarmaNavTime = now; } else { barraActiva = true; return; } }
+  }
+
+  if (menuAlarmaIndex != lastIndex) {
+      if (lastIndex == numAlarmas) dibujarBotonAgregar(false); else if (lastIndex >= 0) dibujarFilaAlarma(lastIndex, false);
+      if (menuAlarmaIndex == numAlarmas) dibujarBotonAgregar(true); else dibujarFilaAlarma(menuAlarmaIndex, true);
+      lastIndex = menuAlarmaIndex;
+  }
+
+  if (now - lastAlarmaBtnTime > 300 && leerBoton(BTN_1)) {
+      if (menuAlarmaIndex == numAlarmas) {
+          modoAgregarAlarma = true; nuevaHora = 8; nuevoMinuto = 0; editandoHora = true; tft.fillRect(20, 20, 440, 280, TFT_BLACK); 
+      } else {
+          alarmas[menuAlarmaIndex].activa = !alarmas[menuAlarmaIndex].activa; dibujarFilaAlarma(menuAlarmaIndex, true); 
       }
-      delay(500);
-    }
+      lastAlarmaBtnTime = now;
   }
 }

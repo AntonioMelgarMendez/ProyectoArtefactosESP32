@@ -9,7 +9,7 @@ extern String internetDesc;
 extern bool internetUpdated;
 // nuevos campos
 extern float internetPrecipMm;
-extern int internetPrecipProb; // 0-100 %
+extern int internetPrecipProb;
 extern float internetWind;
 extern int internetWeatherCode;
 

@@ -6,8 +6,6 @@
 extern TFT_eSPI tft;
 extern String fraseDia;
 extern float temperatura, humedad;
-
-// internet / news externs (definidos en main.ino)
 extern float internetTempC;
 extern String internetDesc;
 extern bool internetUpdated;
@@ -16,10 +14,10 @@ extern int internetPrecipProb;
 extern float internetWind;
 extern int internetWeatherCode;
 
-extern String newsHeadline;   // último titular recibido por RSS
-extern bool newsUpdated;      // flag que indica llegada de un nuevo titular
+extern String newsHeadline;   
+extern bool newsUpdated;      
 
-// Dibujar la base sólo cuando se entra o cambia navIndex
+// Dibujar la base (cajas estáticas)
 inline void dibujarBaseDashboard(int navIndex) {
   tft.fillScreen(TFT_BLACK);
   dibujarBarraNavegacion(navIndex);
@@ -34,13 +32,15 @@ inline void dibujarBaseDashboard(int navIndex) {
   tft.fillRoundRect(20, 250, 440, 40, 6, TFT_NAVY); tft.drawRoundRect(20, 250, 440, 40, 6, TFT_CYAN);
 }
 
-// reloj: redibujar sólo cuando cambie el segundo
-inline void actualizarRelojFecha() {
+
+// reloj: Se añade parámetro 'forzar'
+inline void actualizarRelojFecha(bool forzar = false) {
   struct tm t;
   if(!getLocalTime(&t)) return;
 
   static int lastSecond = -1;
-  if (t.tm_sec == lastSecond) return;
+  // Si NO forzamos Y el segundo es el mismo, salimos
+  if (!forzar && t.tm_sec == lastSecond) return;
   lastSecond = t.tm_sec;
 
   char buf[9]; strftime(buf,sizeof(buf),"%H:%M:%S",&t);
@@ -48,7 +48,8 @@ inline void actualizarRelojFecha() {
   tft.setTextColor(TFT_CYAN); tft.setTextSize(3); tft.setCursor(30,70); tft.print(buf);
 
   static int lastDay = -1;
-  if (t.tm_mday != lastDay) {
+  // Forzar redibujado de fecha tambien si es necesario
+  if (forzar || t.tm_mday != lastDay) {
     lastDay = t.tm_mday;
     char buf2[16]; strftime(buf2,sizeof(buf2),"%d/%m/%Y",&t);
     tft.fillRect(275, 65, 170, 40, TFT_NAVY);
@@ -56,12 +57,15 @@ inline void actualizarRelojFecha() {
   }
 }
 
-// calendario: redibujar sólo cuando cambie día/mes/año o si se fuerza
-inline void actualizarCalendario() {
+// calendario: Se añade parámetro 'forzar'
+inline void actualizarCalendario(bool forzar = false) {
   struct tm timeinfo; if(!getLocalTime(&timeinfo)) return;
   static int lastMonth = -1, lastYear = -1, lastToday = -1;
   int year=timeinfo.tm_year+1900, month=timeinfo.tm_mon+1, today=timeinfo.tm_mday;
-  if (year==lastYear && month==lastMonth && today==lastToday) return;
+  
+  // Si NO forzamos Y la fecha es identica, no hacemos nada
+  if (!forzar && year==lastYear && month==lastMonth && today==lastToday) return;
+  
   lastYear = year; lastMonth = month; lastToday = today;
 
   tm firstDay=timeinfo; firstDay.tm_mday=1; mktime(&firstDay);
@@ -112,10 +116,10 @@ inline void actualizarCalendario() {
   for(int i=0;i<=6;i++) tft.drawLine(drawX, drawY+i*cellSize, drawX+calW, drawY+i*cellSize, TFT_DARKGREY);
 }
 
-// frase del día: sólo redibujar cuando cambie
-inline void actualizarFrase() {
+// frase del día: Se añade parámetro 'forzar'
+inline void actualizarFrase(bool forzar = false) {
   static String lastFrase = "";
-  if (fraseDia == lastFrase) return;
+  if (!forzar && fraseDia == lastFrase) return;
   lastFrase = fraseDia;
 
   tft.fillRect(351,121,108,118,TFT_BLACK);
@@ -128,14 +132,13 @@ inline void actualizarFrase() {
   }
 }
 
-// datos sensor + internet + ticker optimizado (actualiza sólo regiones necesarias)
-inline void actualizarDatosSensor() {
+// datos sensor: Se añade parámetro 'forzar'
+inline void actualizarDatosSensor(bool forzar = false) {
   const int P_X = 230;
   const int P_Y = 120;
   const int P_W = 245;
   const int P_H = 100;
 
-  // --- Validación de datos antes de dibujar ---
   if (isnan(temperatura) || isnan(humedad)) return;
   if (isnan(internetTempC) || isnan(internetPrecipMm) || isnan(internetWind)) return;
 
@@ -146,16 +149,18 @@ inline void actualizarDatosSensor() {
   static int lastWeatherCode = -9999;
 
   bool needSensor = false;
-  if (isnan(lastTemp) || fabs(temperatura - lastTemp) >= 0.2) { lastTemp = temperatura; needSensor = true; }
-  if (isnan(lastHum)  || fabs(humedad - lastHum) >= 1.0) { lastHum = humedad; needSensor = true; }
+  if (forzar || isnan(lastTemp) || fabs(temperatura - lastTemp) >= 0.2) { lastTemp = temperatura; needSensor = true; }
+  if (forzar || isnan(lastHum)  || fabs(humedad - lastHum) >= 1.0) { lastHum = humedad; needSensor = true; }
 
   bool needInternet = internetUpdated ||
+    forzar ||
     isnan(lastInternetTemp) || fabs(internetTempC - lastInternetTemp) >= 0.2 ||
     isnan(lastPrecip) || fabs(internetPrecipMm - lastPrecip) >= 0.1 ||
     isnan(lastWind) || fabs(internetWind - lastWind) >= 0.2 ||
     internetWeatherCode != lastWeatherCode;
 
   if (internetUpdated) internetUpdated = false;
+  
   if (needInternet) {
     lastInternetTemp = internetTempC;
     lastPrecip = internetPrecipMm;
@@ -163,6 +168,7 @@ inline void actualizarDatosSensor() {
     lastWeatherCode = internetWeatherCode;
   }
 
+  // Si necesitamos redibujar (por cambio o por forzado)
   if (needSensor || needInternet) {
     tft.startWrite();
     tft.fillRect(P_X+5, P_Y+5, P_W-10, P_H-10, TFT_BLACK);
@@ -225,228 +231,35 @@ inline void actualizarDatosSensor() {
     tft.endWrite();
   }
 
-  // --- Ticker de noticias con control robusto de duplicados ---
-  const int NEWS_MAX = 8;
-  const int BAR_X = 20;
-  const int BAR_Y = 250;
-  const int BAR_W = 440;
-  const int BAR_H = 40;
-  const int CLIP_X = BAR_X + 6;
-  const int CLIP_Y = BAR_Y + 6;
-  const int CLIP_W = BAR_W - 24;
-  const int TICKER_BASELINE = CLIP_Y + 18;
-  const uint16_t BG_COLOR = TFT_NAVY;
-  const uint16_t TEXT_COLOR = TFT_WHITE;
-  const unsigned long tickerSpeedMs = 30;
-  const int stepPx = 1;
-  const unsigned long pauseMs = 1200;
-
-  static String newsList[NEWS_MAX];
-  static int newsCount = 0;
-  static int newsIdx = 0;
-  static int xPos = 0;
-  static unsigned long lastMove = 0;
-  static bool paused = false;
-  static unsigned long pauseStart = 0;
-  static bool initialized = false;
-
-  static bool bgNeedsRedraw = true;
-  static bool lastEmptyPrinted = false;
-
-  static bool slideMode = false;
-  static int slideOffset = CLIP_Y + BAR_H - CLIP_Y;
-  static unsigned long slideLast = 0;
-  static bool slidePaused = false;
-  static unsigned long slidePauseStart = 0;
-
-  static int prevXPos = INT32_MIN;
-  static int prevNewsIdx = -1;
-  static int prevSlideOffset = INT32_MIN;
-  static bool prevSlideMode = false;
-  static String prevVis = "";
-
-  static unsigned long lastNewsAddMs = 0;
-  const unsigned long NEWS_ADD_DEBOUNCE_MS = 300;
-
-  // --- Agregar noticia solo si no existe ---
-  if (newsUpdated) {
-    newsUpdated = false;
-    String candidate = newsHeadline;
-    candidate.trim();
-    if (candidate.length() > 0) {
-      unsigned long nowMs = millis();
-      if (nowMs - lastNewsAddMs >= NEWS_ADD_DEBOUNCE_MS) {
-        bool duplicate = false;
-        for (int i = 0; i < newsCount; ++i) {
-          if (newsList[i] == candidate) { duplicate = true; break; }
-        }
-        if (!duplicate) {
-          if (newsCount < NEWS_MAX) newsList[newsCount++] = candidate;
-          else {
-            for (int i = 0; i < NEWS_MAX-1; ++i) newsList[i] = newsList[i+1];
-            newsList[NEWS_MAX-1] = candidate;
-          }
-          lastNewsAddMs = nowMs;
-          slideMode = true;
-          slideOffset = BAR_H + 8;
-          slideLast = nowMs;
-          slidePaused = false;
-          bgNeedsRedraw = true;
-          if (!initialized) {
-            initialized = true;
-            newsIdx = 0;
-            xPos = tft.width();
-            paused = false;
-            lastMove = nowMs;
-          }
-        }
-      }
-    }
-  }
-
-  if (bgNeedsRedraw) {
+  // Noticia: Se añade parametro forzar
+  static String lastHeadline = "";
+  if (forzar || newsHeadline != lastHeadline) {
+    lastHeadline = newsHeadline;
     tft.startWrite();
+    const int BAR_X = 20;
+    const int BAR_Y = 250;
+    const int BAR_W = 440;
+    const int BAR_H = 40;
+    const int CLIP_X = BAR_X + 6;
+    const int CLIP_Y = BAR_Y + 6;
+    const int CLIP_W = BAR_W - 24;
+    const int TICKER_BASELINE = CLIP_Y + 18;
+    const uint16_t BG_COLOR = TFT_NAVY;
+    const uint16_t TEXT_COLOR = TFT_WHITE;
+
     tft.fillRoundRect(BAR_X, BAR_Y, BAR_W, BAR_H, 6, BG_COLOR);
     tft.drawRoundRect(BAR_X, BAR_Y, BAR_W, BAR_H, 6, TFT_CYAN);
-    tft.endWrite();
-    bgNeedsRedraw = false;
-    lastEmptyPrinted = false;
-    prevXPos = INT32_MIN;
-    prevVis = "";
-  }
 
-  if (newsCount == 0) {
-    if (!lastEmptyPrinted) {
-      tft.startWrite();
-      tft.setTextSize(2);
-      tft.setTextColor(TEXT_COLOR);
-      tft.fillRect(CLIP_X, CLIP_Y, CLIP_W, BAR_H - 8, BG_COLOR);
-      tft.setCursor(CLIP_X, TICKER_BASELINE);
-      tft.print("Sin titulares");
-      tft.endWrite();
-      lastEmptyPrinted = true;
-    }
-    return;
-  }
-
-  if (newsIdx >= newsCount) newsIdx = 0;
-  if (newsIdx < 0) newsIdx = 0;
-
-  String cur = newsList[newsIdx];
-  String sep = "   .   ";
-  String displayText = cur + sep;
-
-  tft.setTextSize(2);
-  int fullW = tft.textWidth(displayText);
-
-  if (!initialized) {
-    initialized = true;
-    xPos = tft.width();
-    lastMove = millis();
-    paused = false;
-    bgNeedsRedraw = true;
-  }
-
-  unsigned long now = millis();
-
-  if (slideMode) {
-    bool changed = false;
-    if (!slidePaused) {
-      if (now - slideLast >= 25) {
-        slideLast = now;
-        int oldOffset = slideOffset;
-        if (slideOffset > 0) slideOffset -= 4;
-        if (slideOffset <= 0) {
-          slideOffset = 0;
-          slidePaused = true;
-          slidePauseStart = now;
-        }
-        changed = (slideOffset != oldOffset);
-      }
-    } else {
-      if (now - slidePauseStart >= pauseMs) {
-        slideMode = false;
-        xPos = tft.width();
-        lastMove = now;
-        paused = true;
-        pauseStart = now;
-        changed = true;
-      }
-    }
-
-    if (prevSlideMode != slideMode || slideOffset != prevSlideOffset || changed) {
-      tft.startWrite();
-      tft.fillRect(CLIP_X, CLIP_Y, CLIP_W, BAR_H - 8, BG_COLOR);
-      int textW = tft.textWidth(cur);
-      int drawX = CLIP_X + max(0, (CLIP_W - textW) / 2);
-      int drawY = CLIP_Y + slideOffset;
-      if (drawY < CLIP_Y) drawY = CLIP_Y;
-      if (drawY > CLIP_Y + BAR_H - 8) drawY = CLIP_Y + BAR_H - 8;
-      tft.setTextColor(TEXT_COLOR);
-      tft.setCursor(drawX, drawY);
-      tft.print(cur);
-      tft.endWrite();
-      prevSlideOffset = slideOffset;
-      prevSlideMode = slideMode;
-      prevVis = "";
-      prevXPos = INT32_MIN;
-    }
-    return;
-  }
-
-  if (paused) {
-    if (now - pauseStart >= pauseMs) paused = false;
-  } else {
-    if (now - lastMove >= tickerSpeedMs) {
-      lastMove = now;
-      xPos -= stepPx;
-    }
-  }
-
-  int pxStart = CLIP_X - xPos;
-  if (pxStart < 0) pxStart = 0;
-  int charStart = 0;
-  int acc = 0;
-  int len = displayText.length();
-  while (charStart < len) {
-    int w = tft.textWidth(displayText.substring(charStart, charStart+1));
-    if (acc + w > pxStart) break;
-    acc += w;
-    ++charStart;
-  }
-  int pxOffsetInChar = pxStart - acc;
-  int acc2 = 0;
-  int charEnd = charStart;
-  while (charEnd < len) {
-    int w = tft.textWidth(displayText.substring(charEnd, charEnd+1));
-    if (acc2 + w > CLIP_W + pxOffsetInChar) break;
-    acc2 += w;
-    ++charEnd;
-  }
-  if (charEnd <= charStart) charEnd = min(len, charStart + 1);
-  String vis = displayText.substring(charStart, charEnd);
-  int drawX = CLIP_X - pxOffsetInChar;
-
-  if (xPos != prevXPos || vis != prevVis || newsIdx != prevNewsIdx) {
-    tft.startWrite();
-    tft.fillRect(CLIP_X, CLIP_Y, CLIP_W, BAR_H - 8, BG_COLOR);
-    tft.setTextColor(TEXT_COLOR);
     tft.setTextSize(2);
-    tft.setCursor(drawX, TICKER_BASELINE);
-    tft.print(vis);
+    tft.setTextColor(TEXT_COLOR);
+    tft.setCursor(CLIP_X, TICKER_BASELINE);
+    String toShow = newsHeadline.length() > 0 ? newsHeadline : "Sin titulares";
+    if (tft.textWidth(toShow) > CLIP_W) {
+      int maxLen = toShow.length();
+      while (maxLen > 0 && tft.textWidth(toShow.substring(0, maxLen) + "...") > CLIP_W) maxLen--;
+      toShow = toShow.substring(0, maxLen) + "...";
+    }
+    tft.print(toShow);
     tft.endWrite();
-
-    prevXPos = xPos;
-    prevVis = vis;
-    prevNewsIdx = newsIdx;
-  }
-
-  if (xPos + fullW < CLIP_X) {
-    newsIdx = (newsIdx + 1) % newsCount;
-    xPos = tft.width();
-    paused = true;
-    pauseStart = now;
-    prevXPos = INT32_MIN;
-    prevVis = "";
   }
 }

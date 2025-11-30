@@ -5,7 +5,6 @@
 extern String newsHeadline;
 extern bool newsUpdated;
 
-// Obtiene el primer <item><title> de un feed RSS (no requiere key)
 inline void fetch_first_rss_title(const char* rssUrl) {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
