@@ -6,53 +6,46 @@
 #include <time.h>
 #include "DHT.h"
 
-// --- PARCHE BROWNOUT ---
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
-// --- LIBRERÍAS DE AUDIO SD ---
+// --- AUDIO ---
 #include "AudioFileSourceSD.h"
 #include "AudioOutputI2S.h"
 #include "AudioGeneratorMP3.h"
-
-// --- LIBRERÍA BLUETOOTH NATIVA ---
 #include "BluetoothA2DPSink.h"
-#include "ESP_I2S.h" // Usamos I2SClass Nativo (Core 3.0)
+#include "ESP_I2S.h" 
+
+// --- BLUETOOTH SERIAL ---
+#include "BluetoothSerial.h"
 
 #include "utils.h"
 #include "joystick.h"
-#include "sensores.h"
+#include "sensores.h" 
 #include "dashboard.h"
 #include "alarmas.h"
 #include "musica.h"
 #include "weather.h"
 #include "news.h"
 
-// ==========================================
-// VARIABLE MÁGICA (Sobrevive al Reinicio)
-// ==========================================
-RTC_NOINIT_ATTR int modoArranque; // 0=SD, 1=BT
+RTC_NOINIT_ATTR int modoArranque; 
 
-// ==========================================
 // OBJETOS GLOBALES
-// ==========================================
 I2SClass i2s; 
 BluetoothA2DPSink *a2dp_sink = NULL;
+BluetoothSerial SerialBT;
 
-// Punteros para Audio SD
 AudioGeneratorMP3 *mp3 = NULL;
 AudioFileSourceSD *file = NULL;
 AudioOutputI2S *out = NULL;
 
 AudioMode currentAudioMode; 
-
-// Variables Metadatos BT 
 String btTitle = "";
 String btArtist = "";
 String btAlbum = "";
 bool btMetadataChanged = false;
 
-// === CALLBACK METADATOS ===
+// --- CALLBACK METADATA ---
 void avrc_metadata_callback(uint8_t attr_id, const uint8_t *value) {
   switch(attr_id) {
     case ESP_AVRC_MD_ATTR_TITLE:  btTitle = (const char*)value; break;
@@ -81,7 +74,6 @@ DHT dht(DHT_PIN, DHT_TYPE);
 #define PIN_AMP_ENABLE 12
 
 SPIClass sdSPI(HSPI); 
-
 std::vector<String> playlist;
 int songIndex = 0;
 bool isPaused = false;
@@ -98,9 +90,10 @@ bool invertYAxis = false;
 const unsigned long NAV_DELAY = 150;
 const unsigned long BTN_DELAY = 300;
 
-float temperatura = 0, humedad = 0;
+volatile float temperatura = 0;
+volatile float humedad = 0;
 unsigned long lastDHTRead = 0;
-const unsigned long DHT_READ_INTERVAL = 2000;
+
 String fraseDia = "";
 unsigned long lastFraseUpdate = 0;
 const unsigned long FRASE_UPDATE_INTERVAL = 3600000; 
@@ -128,68 +121,78 @@ const double DASH_LAT = 13.6929;
 const double DASH_LON = -89.2182;
 const char* RSS_URL = "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en";
 
+TaskHandle_t TaskSensoresHandle;
+
 // -------------------------------------------------------------------------
-// FUNCIONES AUXILIARES DE CARGA
+// UI & CARGA
 // -------------------------------------------------------------------------
 void dibujarBarraProgreso(int porcentaje, String mensaje) {
-  int w = 300;
-  int h = 20;
-  int x = (480 - w) / 2;
-  int y = 260;
-
+  int w = 300; int h = 20; int x = (480 - w) / 2; int y = 260;
   tft.drawRect(x, y, w, h, TFT_WHITE);
-  
   int fillW = (w - 4) * porcentaje / 100;
   tft.fillRect(x + 2, y + 2, fillW, h - 4, TFT_GREEN);
   tft.fillRect(0, y + 30, 480, 30, TFT_BLACK); 
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM); tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString(mensaje, 240, y + 45, 2);
 }
 
 void mostrarPantallaCarga() {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString("POWER BY ESP32", 240, 100, 4); 
-  
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString("JEFRY BOT", 240, 140, 4);
-
-  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.drawString("Iniciando sistema...", 240, 180, 2);
+  tft.fillScreen(TFT_BLACK); tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK); tft.drawString("POWER BY ESP32", 240, 100, 4); 
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK); tft.drawString("JEFRY BOT", 240, 140, 4);
+  tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK); tft.drawString("Iniciando sistema...", 240, 180, 2);
 }
 
-// -------------------------------------------------------------------------
-// FUNCIONES AUDIO SD
-// -------------------------------------------------------------------------
 void cargarPlaylist(String path) {
   File root = SD.open(path);
   if(!root || !root.isDirectory()) return;
   File f = root.openNextFile();
-  while(f){
-    if(!f.isDirectory()) {
-      String n = String(f.name());
-      if(n.endsWith(".mp3") || n.endsWith(".MP3")) playlist.push_back(n);
-    }
-    f = root.openNextFile();
-  }
+  while(f){ if(!f.isDirectory()) { String n = String(f.name()); if(n.endsWith(".mp3") || n.endsWith(".MP3")) playlist.push_back(n); } f = root.openNextFile(); }
 }
 
 void playCurrentSong(bool autoPlay) {
   if (currentAudioMode != MODE_SD || !mp3) return;
-  
   if (mp3->isRunning()) mp3->stop();
   if (file) { delete file; file = NULL; }
-  
   if (autoPlay) { isPaused = false; digitalWrite(PIN_AMP_ENABLE, HIGH); if(out) out->SetGain(currentVolume); } 
   else { isPaused = true; digitalWrite(PIN_AMP_ENABLE, LOW); if(out) out->SetGain(0); }
-
   if (playlist.size() > 0) {
-    String fileName = playlist[songIndex];
-    String fullPath = String(folderPath) + "/" + fileName;
+    String fileName = playlist[songIndex]; String fullPath = String(folderPath) + "/" + fileName;
     file = new AudioFileSourceSD(fullPath.c_str());
     if(mp3) if(!mp3->begin(file, out)) { delay(100); songIndex = (songIndex + 1) % playlist.size(); playCurrentSong(true); }
+  }
+}
+
+void procesarComandosBT() {
+  if (SerialBT.available()) {
+    String comando = SerialBT.readStringUntil('\n'); comando.trim();
+    if(a2dp_sink != NULL && currentAudioMode == MODE_BT) {
+        if (comando == "play") a2dp_sink->play();
+        else if (comando == "pause") a2dp_sink->pause();
+        else if (comando == "next") a2dp_sink->next();
+        else if (comando == "prev") a2dp_sink->previous();
+        else if (comando == "vol+") { currentVolume += 0.1; if(currentVolume > 1.0) currentVolume = 1.0; a2dp_sink->set_volume((uint8_t)(currentVolume * 127)); }
+        else if (comando == "vol-") { currentVolume -= 0.1; if(currentVolume < 0) currentVolume = 0; a2dp_sink->set_volume((uint8_t)(currentVolume * 127)); }
+    }
+  }
+}
+
+// --- TAREA SEGUNDO PLANO (Core 0) ---
+void TaskSensoresCode(void * pvParameters) {
+  Serial.println("Tarea Sensores Iniciada (Core 0)");
+  // Damos tiempo a que el setup termine
+  vTaskDelay(3000 / portTICK_PERIOD_MS); 
+
+  for(;;) { 
+    if (currentAudioMode == MODE_SD) {
+        gestionarSensoresYEnvio(false); 
+        if (WiFi.status() == WL_CONNECTED) {
+             obtenerFraseDia();
+             internet_open_meteo_loop(DASH_LAT, DASH_LON);
+             news_rss_loop(RSS_URL);
+        }
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS); 
   }
 }
 
@@ -200,312 +203,144 @@ void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
   Serial.begin(115200);
   
-  pinMode(BTN_1, INPUT_PULLUP);
-  pinMode(BTN_2, INPUT_PULLUP);
-  pinMode(PIN_AMP_ENABLE, OUTPUT);
-  digitalWrite(PIN_AMP_ENABLE, HIGH); 
-
+  pinMode(BTN_1, INPUT_PULLUP); pinMode(BTN_2, INPUT_PULLUP);
+  pinMode(PIN_AMP_ENABLE, OUTPUT); digitalWrite(PIN_AMP_ENABLE, HIGH); 
   pinMode(TFT_CS, OUTPUT); digitalWrite(TFT_CS, HIGH);
-  pinMode(SD_CS_PIN, OUTPUT); digitalWrite(SD_CS_PIN, HIGH);
+  pinMode(SD_CS_PIN, OUTPUT); digitalWrite(SD_CS_PIN, HIGH); 
 
-  tft.init();
-  tft.setRotation(3);
-  mostrarPantallaCarga();
-  dibujarBarraProgreso(10, "Cargando Hardware...");
-  delay(500);
+  tft.init(); tft.setRotation(3); mostrarPantallaCarga();
+  dibujarBarraProgreso(10, "Cargando Hardware..."); delay(500);
+  
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS_PIN);
-  if (!SD.begin(SD_CS_PIN, sdSPI, 10000000)) {
-     Serial.println("Fallo SD");
-     dibujarBarraProgreso(15, "Error SD Card!");
-     delay(1000);
-  }
-  else {
-     cargarPlaylist(folderPath);
-     dibujarBarraProgreso(30, "SD Montada OK");
-  }
+  if (!SD.begin(SD_CS_PIN, sdSPI, 10000000)) { Serial.println("Fallo SD"); dibujarBarraProgreso(15, "Error SD Card!"); delay(1000); }
+  else { cargarPlaylist(folderPath); dibujarBarraProgreso(30, "SD Montada OK"); }
+
+  dht.begin(); 
 
   if (modoArranque != 0 && modoArranque != 1) modoArranque = 0;
 
   if (modoArranque == 1) {
-      // *******************************
-      //      MODO BLUETOOTH
-      // *******************************
+      // MODO BLUETOOTH
       dibujarBarraProgreso(50, "Iniciando Bluetooth...");
-      currentAudioMode = MODE_BT;
-      pantallaActual = MUSICA;
-      
+      currentAudioMode = MODE_BT; pantallaActual = MUSICA;
       WiFi.mode(WIFI_OFF); 
-
-      // 1. Configurar I2S
       i2s.setPins(I2S_BCK, I2S_LRC, I2S_DOUT);
-      if (!i2s.begin(I2S_MODE_STD, 44100, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
-         Serial.println("Error I2S");
-      }
+      if (!i2s.begin(I2S_MODE_STD, 44100, I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO)) { Serial.println("Error I2S"); while(1); }
 
-      // 2. Crear Objeto
       a2dp_sink = new BluetoothA2DPSink(i2s);
-      
-      // 3. Metadata
       a2dp_sink->set_avrc_metadata_attribute_mask(ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST | ESP_AVRC_MD_ATTR_ALBUM);
       a2dp_sink->set_avrc_metadata_callback(avrc_metadata_callback);
-
-      // 4. Iniciar
       a2dp_sink->start("ESP32_PLAYER");
       a2dp_sink->set_volume((uint8_t)(currentVolume * 127));
 
-      btTitle = "Esperando...";
-      btArtist = "Conectar Bluetooth";
-      
-      dibujarBarraProgreso(100, "Bluetooth Listo!");
-      delay(500);
+      SerialBT.begin("ESP32_PLAYER"); 
+      btTitle = "Esperando..."; btArtist = "Conectar Bluetooth";
+      dibujarBarraProgreso(100, "Bluetooth Listo!"); delay(500);
 
   } else {
-      // *******************************
-      //         MODO SD
-      // *******************************
+      // MODO SD
       currentAudioMode = MODE_SD;
-      
-      // 1. Mensaje Inicial
       mostrarPantallaCarga();
       dibujarBarraProgreso(10, "Iniciando Audio SD...");
 
-      // 2. Iniciar Audio (Sin reproducir aún)
-      out = new AudioOutputI2S();
-      out->SetPinout(I2S_BCK, I2S_LRC, I2S_DOUT);
-      out->SetGain(currentVolume);
+      out = new AudioOutputI2S(); out->SetPinout(I2S_BCK, I2S_LRC, I2S_DOUT); out->SetGain(currentVolume);
       mp3 = new AudioGeneratorMP3();
       
-      if(playlist.size() > 0) {
-          // Pre-cargar pero pausado para no gastar recursos durante la carga WiFi
-          // (Opcional: playCurrentSong(false) si tu función lo soporta, o dejarlo para el final)
-      }
-
-      // 3. Conectar WiFi (Prioridad Alta)
       dibujarBarraProgreso(30, "Conectando WiFi...");
       WiFi.begin(ssid, password);
-      
       unsigned long startWifi = millis();
-      int progress = 30;
-      
-      // Esperar conexión con timeout
       while(WiFi.status() != WL_CONNECTED && millis() - startWifi < 6000) { 
-         delay(250); 
-         progress += 5;
-         if(progress > 70) progress = 70;
-         dibujarBarraProgreso(progress, "Conectando WiFi...");
+         delay(250); dibujarBarraProgreso(35, "Conectando WiFi...");
       }
       
-      // 4. Descargar Datos (Solo si hay WiFi)
       if(WiFi.status() == WL_CONNECTED) {
-        dibujarBarraProgreso(75, "Descargando Clima...");
+        dibujarBarraProgreso(75, "Conectado. Sincronizando...");
         configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-        
-        // Llamada bloqueante inicial para tener datos YA
-        fetch_open_meteo(DASH_LAT, DASH_LON);
-        
-        dibujarBarraProgreso(85, "Descargando Noticias...");
+        internet_open_meteo_loop(DASH_LAT, DASH_LON);
         fetch_first_rss_title(RSS_URL);
         obtenerFraseDia();
-      } else {
-        dibujarBarraProgreso(80, "WiFi Fallo - Modo Offline");
-        delay(1000);
-      }
-      dibujarBarraProgreso(90, "Iniciando Sensores...");
-      dht.begin(); 
-      delay(500); 
-      leerDHT11(); 
+      } else { dibujarBarraProgreso(80, "Modo Offline"); delay(1000); }
       
-      // 6. Listo
-      dibujarBarraProgreso(100, "Sistema Listo!");
-      delay(500);
-      
-      // Ahora sí, si hay música, cargarla (en pausa)
+      dibujarBarraProgreso(90, "Iniciando Tareas de Fondo...");
+
+      xTaskCreatePinnedToCore(
+        TaskSensoresCode,   
+        "TaskSensores",     
+        30720,              
+        NULL,               
+        1,                  
+        &TaskSensoresHandle,
+        0); // Core 0
+        
+      dibujarBarraProgreso(100, "Sistema Listo!"); delay(500);
       if(playlist.size() > 0) playCurrentSong(false);
   }
+  cal.deadzone = 200; 
+  cal.done = true; 
+  
+  tft.fillScreen(TFT_BLACK); 
+  if (numAlarmas > 0) alarmas[0] = {7, 0, false};
 }
-void leerDHTSeguro() {
-  static unsigned long lastRead = 0;
-  // Leer cada 2 minutos (120000 ms) para no molestar mucho al WiFi
-  if (millis() - lastRead > 120000 || lastRead == 0) { 
-    
-    // 1. Pausar WiFi (Modo ahorro/sin radio) para liberar el ADC2/Pin 33
-    WiFi.setSleep(true); // Opcional: WiFi.disconnect();
-    delay(100); // Dar tiempo al hardware
 
-    // 2. Leer Sensor
-    float t = dht.readTemperature();
-    float h = dht.readHumidity();
-
-    if (!isnan(t)) temperatura = t;
-    if (!isnan(h)) humedad = h;
-
-    // 3. Restaurar WiFi
-    WiFi.setSleep(false); // Despertar radio
-    // Si usaste disconnect, aquí harías WiFi.reconnect();
-    
-    lastRead = millis();
-    Serial.printf("DHT Leído: %.1f C, %.1f %%\n", temperatura, humedad);
-  }
-}
 // -------------------------------------------------------------------------
-// LOOP - CORREGIDO (Navegación Lógica + Botón Atrás)
+// LOOP (NÚCLEO 1)
 // -------------------------------------------------------------------------
 void loop() {
-  // 1. MANTENIMIENTO DE AUDIO (Solo si está sonando)
   if (currentAudioMode == MODE_SD && mp3) {
-      if (mp3->isRunning() && !isPaused) {
-          if (!mp3->loop()) {
-            mp3->stop();
-            songIndex = (songIndex + 1) % playlist.size();
-            playCurrentSong(true); 
-          }
-      }
-  } else {
-      delay(5); // Pequeña pausa para no saturar CPU en modo BT
-  }
+      if (mp3->isRunning() && !isPaused) { if (!mp3->loop()) { mp3->stop(); songIndex = (songIndex + 1) % playlist.size(); playCurrentSong(true); } }
+  } else { delay(5); }
 
-  // 2. SISTEMA Y TAREAS DE FONDO
-  if(!cal.done) {
-    procesoCalibracion();
+  if (currentAudioMode == MODE_BT) { procesarComandosBT(); }
+  
+  if(!cal.done) { 
+
+      procesoCalibracion(); 
   } 
   else {
-    // Tareas en segundo plano (Clima, Hora, etc)
-    if (currentAudioMode == MODE_SD) {
-        // Usar tu función de lectura segura si la implementaste, sino la normal
-        // leerDHTSeguro(); o leerDHT11();
-        leerDHT11(); 
-        obtenerFraseDia();
-        internet_open_meteo_loop(DASH_LAT, DASH_LON);
-        news_rss_loop(RSS_URL);
-    }
 
     unsigned long now = millis();
     DPadDir dir = detectarDireccionJoystick();
-    
-    // Variables estáticas para control de redibujado
     static bool dashboardDrawn = false, alarmasDrawn = false, musicaDrawn = false;
-    static int lastNavIndex = -1;
-    static DPadDir lastDir = DPAD_NONE; // Para evitar rebotes del stick
+    static int lastNavIndex = -1; static DPadDir lastDir = DPAD_NONE;
 
-    // --- LÓGICA DE CONTROL ---
-
-    // CASO ESPECIAL: PANTALLA DE MÚSICA (Tiene su propio control interno)
     if (pantallaActual == MUSICA && !barraActiva) {
         bool inputConsumido = musicaHandleInput(dir, leerBoton(BTN_1), leerBoton(BTN_2));
-        
-        // Si la pantalla de música no usó el "ARRIBA", subimos a la barra
-        if (!inputConsumido && dir == DPAD_UP && lastDir != DPAD_UP) {
-            barraActiva = true; 
-            delay(150); 
-        }
+        if (!inputConsumido && dir == DPAD_UP && lastDir != DPAD_UP) { barraActiva = true; delay(150); }
         lastDir = dir; 
     }
     else {
-        // --- NAVEGACIÓN GENERAL (Dashboard y Alarmas) ---
         if (now - lastNavTime > NAV_DELAY) {
           bool huboMovimiento = false;
-
-          // 1. ENTRAR A LA BARRA (Mover palanca ARRIBA)
-          if (dir == DPAD_UP && lastDir != DPAD_UP && !barraActiva) { 
-              barraActiva = true; 
-              huboMovimiento = true; 
-          } 
-          // 2. SALIR DE LA BARRA (Mover palanca ABAJO) [ESTO ES LO QUE FALLABA]
+          if (dir == DPAD_UP && lastDir != DPAD_UP && !barraActiva) { barraActiva = true; huboMovimiento = true; } 
           else if (dir == DPAD_DOWN && lastDir != DPAD_DOWN && barraActiva) { 
-              barraActiva = false; 
-              huboMovimiento = true; 
-              
-              // Forzar redibujado para borrar rastros de la barra
+              barraActiva = false; huboMovimiento = true; 
               if(pantallaActual == DASHBOARD) dashboardDrawn = false;
               if(pantallaActual == ALARMAS) alarmasDrawn = false;
               if(pantallaActual == MUSICA) musicaDrawn = false;
           }
-
-          // 3. MOVERSE LATERALMENTE EN LA BARRA
           if (barraActiva) {
-            if (dir == DPAD_LEFT && lastDir != DPAD_LEFT) { 
-                navIndex = (navIndex - 1 + 3) % 3; 
-                huboMovimiento = true; 
-            }
-            if (dir == DPAD_RIGHT && lastDir != DPAD_RIGHT) { 
-                navIndex = (navIndex + 1) % 3; 
-                huboMovimiento = true; 
-            }
-          } else { 
-            // Si la barra no está activa, el índice sigue a la pantalla actual
-            navIndex = pantallaActual; 
-          }
-          
+            if (dir == DPAD_LEFT && lastDir != DPAD_LEFT) { navIndex = (navIndex - 1 + 3) % 3; huboMovimiento = true; }
+            if (dir == DPAD_RIGHT && lastDir != DPAD_RIGHT) { navIndex = (navIndex + 1) % 3; huboMovimiento = true; }
+          } else { navIndex = pantallaActual; }
           if (huboMovimiento) lastNavTime = now;
         }
-
-        // --- LÓGICA DE BOTONES ---
         if (now - lastBtnTime > BTN_DELAY) {
           if (barraActiva) {
-            // BTN 1: SELECCIONAR (Entrar a la pantalla)
-            if (leerBoton(BTN_1)) { 
-                pantallaActual = (Pantalla)navIndex; 
-                // Forzamos redibujado de todo al cambiar pantalla
-                dashboardDrawn = false; alarmasDrawn = false; musicaDrawn = false; 
-                barraActiva = false; // Al entrar, desactivamos la barra automáticamente
-                lastBtnTime = now; 
-            }
-            
-            // BTN 2: SALIR / CANCELAR (Quitar la barra) [NUEVO]
-            if (leerBoton(BTN_2)) { 
-                barraActiva = false; // Desactivar barra
-                // Forzamos redibujado para limpiar la selección naranja
-                if(pantallaActual == DASHBOARD) dashboardDrawn = false;
-                if(pantallaActual == ALARMAS) alarmasDrawn = false;
-                if(pantallaActual == MUSICA) musicaDrawn = false;
-                lastBtnTime = now; 
-            }
+            if (leerBoton(BTN_1)) { pantallaActual = (Pantalla)navIndex; dashboardDrawn = false; alarmasDrawn = false; musicaDrawn = false; barraActiva = false; lastBtnTime = now; }
+            if (leerBoton(BTN_2)) { barraActiva = false; if(pantallaActual == DASHBOARD) dashboardDrawn = false; if(pantallaActual == ALARMAS) alarmasDrawn = false; if(pantallaActual == MUSICA) musicaDrawn = false; lastBtnTime = now; }
           }
         }
         lastDir = dir;
     }
 
-    // --- GESTOR DE PANTALLAS (SWITCH) ---
     switch(pantallaActual) {
       case DASHBOARD:
-        {
-          bool forceUpdate = !dashboardDrawn; 
-          if (forceUpdate) { 
-              dibujarBaseDashboard(navIndex); 
-              dashboardDrawn = true; alarmasDrawn = false; musicaDrawn = false; 
-          }
-          // Dibujar barra (se encarga de iluminarse si barraActiva es true)
-          dibujarBarraNavegacion(navIndex);
-          
-          if(currentAudioMode == MODE_SD) {
-             actualizarRelojFecha(forceUpdate); 
-             actualizarCalendario(forceUpdate);
-             actualizarFrase(forceUpdate); 
-             actualizarDatosSensor(forceUpdate);
-          }
-        }
-        break;
-        
+        { bool forceUpdate = !dashboardDrawn; if (forceUpdate) { dibujarBaseDashboard(navIndex); dashboardDrawn = true; alarmasDrawn = false; musicaDrawn = false; } dibujarBarraNavegacion(navIndex); if(currentAudioMode == MODE_SD) { actualizarRelojFecha(forceUpdate); actualizarCalendario(forceUpdate); actualizarFrase(forceUpdate); actualizarDatosSensor(forceUpdate); } } break;
       case ALARMAS:
-        if (!alarmasDrawn) { 
-            dibujarPantallaAlarmas(navIndex); 
-            alarmasDrawn = true; dashboardDrawn = false; musicaDrawn = false; 
-        }
-        dibujarBarraNavegacion(navIndex); 
-        actualizarPantallaAlarmas(); 
-        break;
-        
+        if (!alarmasDrawn) { dibujarPantallaAlarmas(navIndex); alarmasDrawn = true; dashboardDrawn = false; musicaDrawn = false; } dibujarBarraNavegacion(navIndex); actualizarPantallaAlarmas(); break;
       case MUSICA:
-        // Asegurar nombre canción
         if(playlist.size() > 0 && currentAudioMode == MODE_SD) cancionActual = playlist[songIndex];
-        
-        if (!musicaDrawn) { 
-            dibujarPantallaMusica(navIndex); 
-            musicaDrawn = true; dashboardDrawn = false; alarmasDrawn = false; 
-        }
-        dibujarBarraNavegacion(navIndex); 
-        actualizarPantallaMusica();
-        break;
+        if (!musicaDrawn) { dibujarPantallaMusica(navIndex); musicaDrawn = true; dashboardDrawn = false; alarmasDrawn = false; } dibujarBarraNavegacion(navIndex); actualizarPantallaMusica(); break;
     }
   }
 }

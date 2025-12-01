@@ -5,7 +5,8 @@
 
 extern TFT_eSPI tft;
 extern String fraseDia;
-extern float temperatura, humedad;
+extern volatile float temperatura;
+extern volatile float humedad;
 extern float internetTempC;
 extern String internetDesc;
 extern bool internetUpdated;
@@ -33,13 +34,11 @@ inline void dibujarBaseDashboard(int navIndex) {
 }
 
 
-// reloj: Se añade parámetro 'forzar'
 inline void actualizarRelojFecha(bool forzar = false) {
   struct tm t;
   if(!getLocalTime(&t)) return;
 
   static int lastSecond = -1;
-  // Si NO forzamos Y el segundo es el mismo, salimos
   if (!forzar && t.tm_sec == lastSecond) return;
   lastSecond = t.tm_sec;
 
@@ -48,7 +47,6 @@ inline void actualizarRelojFecha(bool forzar = false) {
   tft.setTextColor(TFT_CYAN); tft.setTextSize(3); tft.setCursor(30,70); tft.print(buf);
 
   static int lastDay = -1;
-  // Forzar redibujado de fecha tambien si es necesario
   if (forzar || t.tm_mday != lastDay) {
     lastDay = t.tm_mday;
     char buf2[16]; strftime(buf2,sizeof(buf2),"%d/%m/%Y",&t);
@@ -62,8 +60,6 @@ inline void actualizarCalendario(bool forzar = false) {
   struct tm timeinfo; if(!getLocalTime(&timeinfo)) return;
   static int lastMonth = -1, lastYear = -1, lastToday = -1;
   int year=timeinfo.tm_year+1900, month=timeinfo.tm_mon+1, today=timeinfo.tm_mday;
-  
-  // Si NO forzamos Y la fecha es identica, no hacemos nada
   if (!forzar && year==lastYear && month==lastMonth && today==lastToday) return;
   
   lastYear = year; lastMonth = month; lastToday = today;
@@ -167,8 +163,6 @@ inline void actualizarDatosSensor(bool forzar = false) {
     lastWind = internetWind;
     lastWeatherCode = internetWeatherCode;
   }
-
-  // Si necesitamos redibujar (por cambio o por forzado)
   if (needSensor || needInternet) {
     tft.startWrite();
     tft.fillRect(P_X+5, P_Y+5, P_W-10, P_H-10, TFT_BLACK);

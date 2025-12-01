@@ -21,9 +21,6 @@ struct JoystickCal {
   int y_min = 4095; 
   int y_max = 268; 
   int y_center = 3153; 
-  
-  // [CAMBIO 1] Aumentamos drásticamente la zona muerta (de 200 a 600)
-  // Esto hace que tengas que mover el stick con más decisión para que reaccione.
   int deadzone = 600; 
   
   bool x_invertido = false;
